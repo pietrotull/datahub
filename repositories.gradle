@@ -1,5 +1,4 @@
 repositories {
-    gradlePluginPortal()
     mavenLocal()
 
     if (project.hasProperty('apacheMavenRepositoryUrl')) {
