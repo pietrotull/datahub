@@ -124,6 +124,15 @@ def _clean_grafana_template_variables(query: str) -> str:
     return query
 
 
+def _normalize_grafana_sql(query: str) -> str:
+    """Apply lightweight Grafana SQL normalization before parser cleanup."""
+    normalized = query.replace("\\r\\n", "\n").replace("\\n", "\n")
+    normalized = normalized.replace("\\t", " ").strip()
+    if normalized.endswith(";"):
+        normalized = normalized[:-1].strip()
+    return normalized
+
+
 class LineageExtractor:
     """Handles extraction of lineage information from Grafana panels"""
 
@@ -154,23 +163,37 @@ class LineageExtractor:
 
         ds_type, ds_uid = self._extract_datasource_info(panel.datasource_ref)
         raw_sql = self._extract_raw_sql(panel.query_targets)
-        ds_urn = self._build_dataset_urn(ds_type, ds_uid, dashboard_uid, panel.id)
+        # Keep compatibility with 1.4.x variants.
+        try:
+            ds_urn = self._build_dataset_urn(ds_type, ds_uid, dashboard_uid, panel.id)
+        except TypeError:
+            ds_urn = self._build_dataset_urn(ds_type, ds_uid, panel.id)
 
-        # Handle platform-specific lineage
-        if ds_uid in self.connection_map:
-            if raw_sql:
-                parsed_sql = self._parse_sql(raw_sql, self.connection_map[ds_uid])
-                if parsed_sql:
-                    lineage = self._create_column_lineage(ds_urn, parsed_sql)
-                    if lineage:
-                        return lineage
+        # Resolve mapping by UID first, then datasource name/type fallback.
+        ds_name = panel.datasource_ref.name if panel.datasource_ref else None
+        platform_config = (
+            self.connection_map.get(ds_uid)
+            or (self.connection_map.get(ds_name) if ds_name else None)
+            or self.connection_map.get(ds_type)
+        )
 
-            # Fall back to basic lineage if SQL parsing fails or no column lineage created
-            return self._create_basic_lineage(
-                ds_uid, self.connection_map[ds_uid], ds_urn
-            )
+        if not platform_config:
+            return None
 
-        return None
+        if raw_sql:
+            parsed_sql = self._parse_sql(raw_sql, platform_config)
+            if parsed_sql:
+                lineage = self._create_column_lineage(ds_urn, parsed_sql)
+                if lineage:
+                    return lineage
+
+                # Preserve table-level lineage when column lineage is empty.
+                table_lineage = self._create_table_lineage(ds_urn, parsed_sql)
+                if table_lineage:
+                    return table_lineage
+
+        # Fallback when SQL parsing fails or no parsed lineage can be built.
+        return self._create_basic_lineage(ds_uid, platform_config, ds_urn)
 
     def _extract_datasource_info(
         self, datasource_ref: "DatasourceRef"
@@ -181,13 +204,46 @@ class LineageExtractor:
     def _extract_raw_sql(
         self, query_targets: List["GrafanaQueryTarget"]
     ) -> Optional[str]:
-        """Extract raw SQL from panel query targets."""
+        """Extract SQL text from panel query targets.
+
+        Grafana datasource plugins don't always use a single key.
+        Collect common top-level keys and nested payload keys, then
+        select the most SQL-like candidate.
+        """
+        candidate_sql_keys = ("rawSql", "query", "sql", "expr")
+        candidates: List[str] = []
+
         for target in query_targets:
-            # Handle case variations: rawSql, rawSQL, etc.
-            for key, value in target.items():
-                if key.lower() == "rawsql" and value:
-                    return value
-        return None
+            for key in candidate_sql_keys:
+                value = target.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidates.append(value)
+
+            for nested in target.values():
+                if not isinstance(nested, dict):
+                    continue
+                for key in candidate_sql_keys:
+                    value = nested.get(key)
+                    if isinstance(value, str) and value.strip():
+                        candidates.append(value)
+
+        if not candidates:
+            return None
+
+        unique_candidates = list(dict.fromkeys(candidates))
+
+        def _score(candidate: str) -> Tuple[int, int]:
+            lowered = candidate.lower()
+            score = 0
+            if "select " in lowered:
+                score += 1
+            if " from " in lowered:
+                score += 2
+            if " join " in lowered:
+                score += 1
+            return score, len(candidate)
+
+        return max(unique_candidates, key=_score)
 
     def _build_dataset_urn(
         self, ds_type: str, ds_uid: str, dashboard_uid: str, panel_id: str
@@ -232,6 +288,28 @@ class LineageExtractor:
             ),
         )
 
+    def _create_table_lineage(
+        self,
+        dataset_urn: str,
+        parsed_sql: SqlParsingResult,
+    ) -> Optional[MetadataChangeProposalWrapper]:
+        """Create table-level lineage when parsed SQL has upstream tables but no column lineage."""
+        if not parsed_sql.in_tables:
+            return None
+
+        return MetadataChangeProposalWrapper(
+            entityUrn=dataset_urn,
+            aspect=UpstreamLineageClass(
+                upstreams=[
+                    UpstreamClass(
+                        dataset=table,
+                        type=DatasetLineageTypeClass.TRANSFORMED,
+                    )
+                    for table in parsed_sql.in_tables
+                ]
+            ),
+        )
+
     def _parse_sql(
         self, sql: str, platform_config: PlatformConnectionConfig
     ) -> Optional[SqlParsingResult]:
@@ -240,24 +318,49 @@ class LineageExtractor:
             logger.warning("No DataHub graph specified for SQL parsing.")
             return None
 
-        try:
-            # Clean Grafana template variables before parsing
-            # Variables like ${__from}, $datasource, [[var]] break SQL parsers
-            cleaned_sql = _clean_grafana_template_variables(sql)
+        normalized_sql = _normalize_grafana_sql(sql)
+        sql_candidates = list(dict.fromkeys([sql, normalized_sql]))
+        last_error: Optional[Exception] = None
 
-            return create_lineage_sql_parsed_result(
-                query=cleaned_sql,
-                platform=platform_config.platform,
-                platform_instance=platform_config.platform_instance,
-                env=platform_config.env,
-                default_db=platform_config.database,
-                default_schema=platform_config.database_schema,
-                graph=self.graph,
-            )
-        except ValueError as e:
-            logger.error(f"SQL parsing error for query: {sql}", exc_info=e)
-        except Exception as e:
-            logger.exception(f"Unexpected error during SQL parsing: {sql}", exc_info=e)
+        for candidate_sql in sql_candidates:
+            cleaned_sql = _clean_grafana_template_variables(candidate_sql)
+            for schema_aware in (True, False):
+                try:
+                    parsed_sql = create_lineage_sql_parsed_result(
+                        query=cleaned_sql,
+                        platform=platform_config.platform,
+                        platform_instance=platform_config.platform_instance,
+                        env=platform_config.env,
+                        default_db=platform_config.database,
+                        default_schema=platform_config.database_schema,
+                        graph=self.graph,
+                        schema_aware=schema_aware,
+                    )
+                except TypeError:
+                    # Backward compatibility for parser signatures without schema_aware.
+                    if not schema_aware:
+                        continue
+
+                    parsed_sql = create_lineage_sql_parsed_result(
+                        query=cleaned_sql,
+                        platform=platform_config.platform,
+                        platform_instance=platform_config.platform_instance,
+                        env=platform_config.env,
+                        default_db=platform_config.database,
+                        default_schema=platform_config.database_schema,
+                        graph=self.graph,
+                    )
+
+                if parsed_sql.in_tables or parsed_sql.column_lineage:
+                    return parsed_sql
+
+                if parsed_sql.debug_info.error is None:
+                    return parsed_sql
+
+                last_error = parsed_sql.debug_info.error
+
+        if last_error:
+            logger.error(f"SQL parsing error for query: {sql}", exc_info=last_error)
 
         return None
 
